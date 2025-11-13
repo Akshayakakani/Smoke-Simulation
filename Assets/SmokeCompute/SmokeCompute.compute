@@ -1,0 +1,699 @@
+#pragma kernel Init
+#pragma kernel UpdateObstacleMap
+#pragma kernel UpdateObstacleEdges
+#pragma kernel Interaction
+#pragma kernel ExternalForces
+#pragma kernel Buoyancy
+#pragma kernel PreparePressureSolver
+#pragma kernel PressureSolve_RedBlack
+#pragma kernel VelocityPressureUpdate
+#pragma kernel VelocitySelfAdvection
+#pragma kernel AdvectedVelocityReadback
+#pragma kernel SmokeAdvection
+#pragma kernel SmokeDiffusionAndReadback
+#pragma kernel Debug_UpdateDivergenceDisplay
+
+struct SceneElement
+{
+    int shapeType;
+    int isObstacle;
+    int isInstantSource;
+    float2 pos;
+    float2 posLineEnd;
+    float2 size;
+    float2 velocitySource;
+    float3 smokeRate;
+    float targetTemperature;
+};
+
+
+// ---- Maps ----
+RWTexture2D<float2> VelocityMap;
+RWTexture2D<float2> VelocityMapAdvected;
+RWTexture2D<float2> ObstacleMap; // r > 0 = obstacle, g is precomputed map of neighbour edges
+RWTexture2D<float4> SmokeMap; // rgb = smoke values, a = temperature
+RWTexture2D<float4> SmokeMapAdvected;
+RWTexture2D<float> PressureMap;
+RWTexture2D<float2> PressureSolveData;
+RWTexture2D<float4> DebugMap;
+
+// ---- Samplers ----
+Texture2D<float2> VelocityMapSample;
+SamplerState samplerVelocityMapSample;
+Texture2D SmokeMapSample;
+SamplerState samplerSmokeMapSample;
+
+// ---- Buffers ----
+StructuredBuffer<SceneElement> Elements;
+const int ElementCount;
+
+// ---- Settings ----
+const uint2 resolution;
+const float2 worldSize;
+const float gravity;
+const float time;
+const float deltaTime;
+const float unscaledDeltaTime;
+const float velocityMultiplier;
+const float cellSize;
+const float temperatureRate;
+const float temperatureDiffusion;
+const float temperatureDecay;
+const float smokeDiffusion;
+const float smokeDecay;
+const float ambientTemperature;
+const float buoyancyFactor_temperature;
+const float buoyancyFactor_smoke;
+const float windX;
+const bool openRightEdge;
+const bool openTopEdge;
+
+// Solver
+const bool clearPressure;
+const uint halfCellCount;
+const uint passIndex;
+const float weightSOR = 1.7;
+const float K; // timestep / (density * cellSize)
+
+// Interaction
+const bool interaction_AddSmoke;
+const bool interaction_SetVelocities;
+const float interaction_Radius;
+const float brushStrength;
+const float2 interaction_Centre;
+const float2 interaction_Delta;
+
+// ---- Constants ----
+static const uint LEFT = 0;
+static const uint RIGHT = 1;
+static const uint BOTTOM = 2;
+static const uint TOP = 3;
+
+// ---- Helper functions ----
+
+float2 CellCentreFromCoord(int x, int y)
+{
+    return (float2(x + 0.5, y + 0.5) - resolution * 0.5) * cellSize;
+}
+
+float2 CellEdgeLeft(int x, int y)
+{
+    return (float2(x, y + 0.5) - resolution * 0.5) * cellSize;
+}
+
+float2 CellEdgeBottom(int x, int y)
+{
+    return (float2(x + 0.5, y) - resolution * 0.5) * cellSize;
+}
+
+
+uint2 ClampCoord(int x, int y, int w, int h)
+{
+    return uint2(max(0, min(x, w - 1)), max(0, min(y, h - 1)));
+}
+
+uint2 ClampCoord(int x, int y)
+{
+    return ClampCoord(x, y, resolution.x, resolution.y);
+}
+
+bool IsSolidCell(int x, int y)
+{
+    //if (x < 0 || x >= (int)resolution.x || y < 0 || y >= (int)resolution.y) return true;
+    return ObstacleMap[ClampCoord(x, y)].r;
+}
+
+float4 SampleBilinear(RWTexture2D<float4> tex, float u, float v, int w, int h)
+{
+    float px = u * w - 0.5;
+    float py = v * h - 0.5;
+
+    int x = (int)px;
+    int y = (int)py;
+
+    float xFrac = saturate(px - x);
+    float yFrac = saturate(py - y);
+
+    float4 bottomLeft = tex[ClampCoord(x, y)];
+    float4 bottomRight = tex[ClampCoord(x + 1, y)];
+    float4 topLeft = tex[ClampCoord(x, y + 1)];
+    float4 topRight = tex[ClampCoord(x + 1, y + 1)];
+
+    float4 interpolatedTop = lerp(topLeft, topRight, xFrac);
+    float4 interpolatedBottom = lerp(bottomLeft, bottomRight, xFrac);
+    return lerp(interpolatedBottom, interpolatedTop, yFrac);
+}
+
+float2 SampleBilinear_Velocity(RWTexture2D<float2> tex, float u, float v, int w, int h)
+{
+    float px = u * w - 0.5;
+    float py = v * h - 0.5;
+
+    int x = (int)px;
+    int y = (int)py;
+
+    float xFrac = saturate(px - x);
+    float yFrac = saturate(py - y);
+
+    float2 bottomLeft = tex[ClampCoord(x, y)];
+    float2 bottomRight = tex[ClampCoord(x + 1, y)];
+    float2 topLeft = tex[ClampCoord(x, y + 1)];
+    float2 topRight = tex[ClampCoord(x + 1, y + 1)];
+
+    float2 interpolatedTop = lerp(topLeft, topRight, xFrac);
+    float2 interpolatedBottom = lerp(bottomLeft, bottomRight, xFrac);
+    return lerp(interpolatedBottom, interpolatedTop, yFrac);
+}
+
+
+float2 GetAdvectedVelocity(int x, int y)
+{
+    // Out of bounds
+    if (x < 0 || y < 0 || x >= (int)resolution.x || y >= (int)resolution.y)
+    {
+        return 0;
+    }
+
+    return VelocityMapAdvected[int2(x, y)];
+}
+
+float2 GetVelocityAtCoord(int x, int y)
+{
+    // Out of bounds
+    if (x < 0 || y < 0 || x >= (int)resolution.x || y >= (int)resolution.y)
+    {
+        return 0;
+    }
+
+    return VelocityMap[int2(x, y)];
+}
+
+float2 GetVelocityAtWorldPos(float2 worldPos)
+{
+    int2 numCells = (int2)resolution;
+
+    // Velocity x
+    float2 bottomLeft_X = float2(-numCells.x / 2.0 - 0.5, -numCells.y / 2.0) * cellSize;
+    float2 topRight_X = float2(numCells.x / 2.0 - 0.5, numCells.y / 2.0) * cellSize;
+    float2 uvX = (worldPos - bottomLeft_X) / (topRight_X - bottomLeft_X);
+    float velocityX = VelocityMapSample.SampleLevel(samplerVelocityMapSample, uvX, 0).r;
+
+    // Velocity y
+    float2 bottomLeft_Y = float2(-numCells.x / 2.0, -numCells.y / 2.0 - 0.5) * cellSize;
+    float2 topRight_Y = float2(numCells.x / 2.0, numCells.y / 2.0 - 0.5) * cellSize;
+    float2 uvY = (worldPos - bottomLeft_Y) / (topRight_Y - bottomLeft_Y);
+    float velocityY = VelocityMapSample.SampleLevel(samplerVelocityMapSample, uvY, 0).y;
+
+    return float2(velocityX, velocityY);
+}
+
+float4 GetSmokeAtWorldPos(float2 worldPos)
+{
+    float2 bottomLeft = -worldSize / 2;
+
+    float u = (worldPos.x - bottomLeft.x) / worldSize.x;
+    float v = (worldPos.y - bottomLeft.y) / worldSize.y;
+    if (u < 0 || u > 1 || v < 0 || v > 1) return float4(0, 0, 0, ambientTemperature);
+    return SmokeMapSample.SampleLevel(samplerSmokeMapSample, float2(u, v), 0);
+}
+
+
+float4 GetAdvectedSmokeData(int x, int y)
+{
+    // Out of bounds
+    if (x < 0 || y < 0 || x >= (int)resolution.x || y >= (int)resolution.y)
+    {
+        return float4(0, 0, 0, ambientTemperature);
+    }
+
+    return SmokeMapAdvected[int2(x, y)];
+}
+
+
+bool BoxContainsPoint(float2 boxCentre, float2 boxSize, float2 p)
+{
+    float2 o = abs(p - boxCentre) * 2;
+    return (o.x <= boxSize.x && o.y <= boxSize.y);
+}
+
+bool CircleContainsPoint(float2 centre, float radius, float2 p)
+{
+    float2 offset = centre - p;
+    float sqrDst = dot(offset, offset);
+    return sqrDst < radius * radius;
+}
+
+
+float MouseInteractionWeight(float2 p)
+{
+    float2 offset = interaction_Centre - p;
+    float sqrDst = dot(offset, offset);
+    float sqrRadius = interaction_Radius * interaction_Radius;
+    float weight = 1 - pow(saturate(sqrDst / sqrRadius), 1);
+    return weight;
+}
+
+// Get point on the line segment (a1, a2) that's closest to the given point (p)
+float3 ClosestPointOnLineSegment(float3 p, float3 a1, float3 a2)
+{
+    float3 lineDelta = a2 - a1;
+    float3 pointDelta = p - a1;
+    float sqrLineLength = dot(lineDelta, lineDelta);
+
+    if (sqrLineLength == 0)
+        return a1;
+
+    float t = saturate(dot(pointDelta, lineDelta) / sqrLineLength);
+    return a1 + lineDelta * t;
+}
+
+// Calculates smallest distance from given point to the line segment (a1, a2)
+float DistanceToLineSegment(float3 p, float3 a1, float3 a2)
+{
+    float3 closestPoint = ClosestPointOnLineSegment(p, a1, a2);
+    return length(p - closestPoint);
+}
+
+bool IsPointInSceneElement(SceneElement element, float2 pos)
+{
+    if (element.shapeType == 0) // circle
+    {
+        return CircleContainsPoint(element.pos, element.size.x, pos);
+    }
+    else if (element.shapeType == 1) // quad
+    {
+        return BoxContainsPoint(element.pos, element.size, pos);
+    }
+    else // Line//
+    {
+        //return length(pos - element.posLineEnd) < 1;
+        return DistanceToLineSegment(float3(pos, 0), float3(element.pos, 0), float3(element.posLineEnd, 0)) < element.size.x;
+    }
+}
+
+float2 RewindPos(float2 worldPos)
+{
+    float2 velocity = GetVelocityAtWorldPos(worldPos);
+    float2 posOld = worldPos - velocity * deltaTime;
+    return posOld;
+}
+
+float GetPressure(int x, int y)
+{
+    if (x < 0 || x >= (int)resolution.x || y < 0 || y >= (int)resolution.y) return 0;
+    return PressureMap[int2(x, y)];
+}
+
+uint2 CheckerboardCoord(uint i, uint passIndex, uint2 resolution)
+{
+    uint coordY = i / (resolution.x / 2); // Note: width assumed to be even
+    uint coordX = (2 * i) % resolution.x;
+    if (coordY % 2 != passIndex % 2) coordX++;
+    uint2 cell = uint2(coordX, coordY);
+    return cell;
+}
+
+
+// ---- Kernels ----
+
+[numthreads(8,8,1)]
+void Init(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    VelocityMap[id.xy] = 0;
+
+
+    SmokeMap[id.xy] = float4(0, 0, 0, ambientTemperature);
+
+    PressureMap[id.xy] = 0;
+    ObstacleMap[id.xy] = 0;
+}
+
+[numthreads(8,8,1)]
+void UpdateObstacleMap(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    bool isObstacle = ObstacleMap[id.xy].x > 0;
+
+    // Map border
+    bool isMapBoundary = id.x == 0 || id.y == 0;
+    if (!openRightEdge) isMapBoundary = isMapBoundary | (id.x == resolution.x - 1);
+    if (!openTopEdge) isMapBoundary = isMapBoundary | id.y == resolution.y - 1;
+
+
+    if (isMapBoundary)
+    {
+        isObstacle = true;
+        // Enforce ambient temperature at boundary
+        SmokeMap[id.xy] = float4(SmokeMap[id.xy].rgb, ambientTemperature);
+    }
+
+    float2 worldPos = CellCentreFromCoord(id.x, id.y);
+
+    if (!isObstacle)
+    {
+        for (int i = 0; i < ElementCount; i++)
+        {
+            SceneElement element = Elements[i];
+            if (element.isObstacle && IsPointInSceneElement(element, worldPos))
+            {
+                isObstacle = true;
+                break;
+            }
+        }
+    }
+
+    ObstacleMap[id.xy] = float2(isObstacle, 0);
+}
+
+[numthreads(8,8,1)]
+void UpdateObstacleEdges(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    int obstacleSelf = IsSolidCell(id.x, id.y);
+    int obstacleEdgeN = obstacleSelf | IsSolidCell(id.x, id.y + 1);
+    int obstacleEdgeS = obstacleSelf | IsSolidCell(id.x, id.y - 1);
+    int obstacleEdgeW = obstacleSelf | IsSolidCell(id.x - 1, id.y);
+    int obstacleEdgeE = obstacleSelf | IsSolidCell(id.x + 1, id.y);
+
+    int edgeCase = (obstacleEdgeW << LEFT) | (obstacleEdgeE << RIGHT) | (obstacleEdgeS << BOTTOM) | (obstacleEdgeN << TOP);
+    ObstacleMap[id.xy] = float2(obstacleSelf, edgeCase);
+}
+
+
+[numthreads(8,8,1)]
+void Interaction(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    float2 cellCentreWorld = CellCentreFromCoord(id.x, id.y);
+    float2 offset = interaction_Centre - cellCentreWorld;
+    float sqrRadius = interaction_Radius * interaction_Radius;
+    float interactionSqrDst = dot(offset, offset);
+
+    if (interaction_AddSmoke)
+    {
+        if (interactionSqrDst < sqrRadius)
+        {
+            float brushWeight = 1 - smoothstep(0.1, 0.9, interactionSqrDst / sqrRadius);
+            float smokeAdd = deltaTime * deltaTime / unscaledDeltaTime * 150 * brushWeight;
+            SmokeMap[id.xy] = SmokeMap[id.xy] + float4(0, smokeAdd, 0, 0);
+        }
+    }
+
+    if (interaction_SetVelocities)
+    {
+        float wL = MouseInteractionWeight(CellEdgeLeft(id.x, id.y));
+        float wB = MouseInteractionWeight(CellEdgeBottom(id.x, id.y));
+        float2 velocityAdd = interaction_Delta * velocityMultiplier;
+
+        int obstacleSelf = IsSolidCell(id.x, id.y);
+        int obstacleEdge_W = obstacleSelf | IsSolidCell(id.x - 1, id.y);
+        int obstacleEdge_S = obstacleSelf | IsSolidCell(id.x, id.y - 1);
+
+        float2 packedVelAdd = velocityAdd.xy * float2(wL, wB);
+        packedVelAdd.x *= (1 - obstacleEdge_W);
+        packedVelAdd.y *= (1 - obstacleEdge_S);
+        VelocityMap[id.xy] += packedVelAdd;
+    }
+}
+
+
+[numthreads(8,8,1)]
+void ExternalForces(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    float2 worldPos = CellCentreFromCoord(id.x, id.y);
+    float4 smokeData = SmokeMap[id.xy];
+
+    float2 velFromSrc = 0;
+
+    int obstacleEdgeCase = (int)ObstacleMap[id.xy].g;
+    int obstacleS = (obstacleEdgeCase >> BOTTOM) & 1;
+    int obstacleW = (obstacleEdgeCase >> LEFT) & 1;
+
+    bool isObstacle = IsSolidCell(id.x, id.y);
+
+    for (int i = 0; i < ElementCount; i++)
+    {
+        SceneElement element = Elements[i];
+        if (IsPointInSceneElement(element, worldPos))
+        {
+            // Temperature
+            float temperature = smokeData.a;
+            float heatDelta = (element.targetTemperature - temperature) * temperatureRate * deltaTime;
+            smokeData.a += heatDelta;
+
+            if (!element.isObstacle)
+            {
+                // Velocity
+                velFromSrc += element.velocitySource;
+                
+
+                // Smoke
+                if (element.isInstantSource) smokeData.rgb = element.smokeRate;
+                else smokeData.rgb += element.smokeRate * deltaTime;
+            }
+        }
+    }
+
+    if (isObstacle) smokeData.rgb = 0;
+    SmokeMap[id.xy] = smokeData;
+
+    // Buoyancy
+    float2 velocity = VelocityMap[id.xy];
+
+    float2 viscAcc = 0;
+    velocity.x += (velFromSrc.x + viscAcc.x) * deltaTime * (1 - obstacleW);
+    velocity.y += (velFromSrc.y + viscAcc.y) * deltaTime * (1 - obstacleS);
+
+
+    if (windX != 0)
+    {
+        if (id.x == 1 && id.y > 0 && id.y < resolution.y - 1)
+        {
+            velocity = float2(windX, 0);
+        }
+    }
+
+    VelocityMap[id.xy] = velocity;
+    VelocityMapAdvected[id.xy] = 0;
+}
+
+[numthreads(8,8,1)]
+void Buoyancy(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= resolution)) return;
+
+    int obstacleEdgeCase = (int)ObstacleMap[id.xy].g;
+    int obstacleS = (obstacleEdgeCase >> BOTTOM) & 1;
+
+    //return;
+    float2 cellBottomEdge = CellEdgeBottom(id.x, id.y);
+    float4 smokeData = GetSmokeAtWorldPos(cellBottomEdge);
+
+    // Hot air rises
+    float temperature = smokeData.a;
+    float relativeTemperature = temperature - ambientTemperature;
+    float buoyancyForceTemperature = -buoyancyFactor_temperature * relativeTemperature * gravity;
+
+    // Heavy smoke sinks
+    float3 smoke = smokeData.rgb;
+    float smokeConcentration = dot(smoke, 1) / 3;
+    float buoyancyForceSmoke = buoyancyFactor_smoke * smokeConcentration * gravity;
+
+    VelocityMap[id.xy] += float2(0, buoyancyForceTemperature + buoyancyForceSmoke) * deltaTime * (1 - obstacleS);
+}
+
+[numthreads(8,8,1)]
+void PreparePressureSolver(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    // Figure out which edges fluid can flow across
+    int isSolidCell = IsSolidCell(id.x, id.y);
+    int flowTop = 1 - (isSolidCell | IsSolidCell(id.x, id.y + 1));
+    int flowLeft = 1 - (isSolidCell | IsSolidCell(id.x - 1, id.y));
+    int flowRight = 1 - (isSolidCell | IsSolidCell(id.x + 1, id.y));
+    int flowBottom = 1 - (isSolidCell | IsSolidCell(id.x, id.y - 1));
+    // Pack edges permitting flow into 4bit integer
+    int packedEdgeFlow = flowLeft << LEFT | flowRight << RIGHT | flowBottom << BOTTOM | flowTop << TOP;
+
+    // Compute velocity term of pressure calculation
+    float velTop = VelocityMap[ClampCoord(id.x, id.y + 1)].y;
+    float velRight = VelocityMap[ClampCoord(id.x + 1, id.y)].x;
+    float velBottom = VelocityMap[id.xy].y;
+    float velLeft = VelocityMap[id.xy].x;
+
+    float velocityTerm;
+    int edgeFlowCount = flowTop + flowBottom + flowLeft + flowRight;
+
+    if (edgeFlowCount == 0) velocityTerm = 0;
+    else velocityTerm = (velRight - velLeft + velTop - velBottom) / (edgeFlowCount * K);
+
+    // Store:
+    PressureSolveData[id.xy] = float2(velocityTerm, packedEdgeFlow); // Precomputed solve data
+    if (clearPressure) PressureMap[id.xy] = 0; // Initial pressure
+}
+
+[numthreads(64,1,1)]
+void PressureSolve_RedBlack(uint3 threadIndex : SV_DispatchThreadID)
+{
+    if (threadIndex.x >= halfCellCount) return;
+
+    uint2 cell = CheckerboardCoord(threadIndex.x, passIndex, resolution);
+    // Unpack precomputed data
+    float velocityTerm = PressureSolveData[cell].r;
+    int edgeFlowCase = (int)PressureSolveData[cell].g;
+    int flowTop = (edgeFlowCase >> TOP) & 1;
+    int flowLeft = (edgeFlowCase >> LEFT) & 1;
+    int flowRight = (edgeFlowCase >> RIGHT) & 1;
+    int flowBottom = (edgeFlowCase >> BOTTOM) & 1;
+    int edgeFlowCount = flowTop + flowBottom + flowLeft + flowRight;
+    if (edgeFlowCount == 0) return;
+
+    // Solve pressure
+    float pressureTop = GetPressure(cell.x, cell.y + 1) * flowTop;
+    float pressureLeft = GetPressure(cell.x - 1, cell.y) * flowLeft;
+    float pressureRight = GetPressure(cell.x + 1, cell.y) * flowRight;
+    float pressureBottom = GetPressure(cell.x, cell.y - 1) * flowBottom;
+    float pressureTerm = (pressureLeft + pressureRight + pressureBottom + pressureTop) / edgeFlowCount;
+    float pressureNew = pressureTerm - velocityTerm;
+
+    // Successive over-relaxation
+    float pressureOld = PressureMap[cell];
+    PressureMap[cell] = pressureOld + (pressureNew - pressureOld) * weightSOR;
+}
+
+
+[numthreads(8,8,1)]
+void VelocityPressureUpdate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    int obstacleEdgeCase = (int)ObstacleMap[id.xy].g;
+    int canFlowL = 1 - ((obstacleEdgeCase >> LEFT) & 1);
+    int canFlowR = 1 - ((obstacleEdgeCase >> RIGHT) & 1);
+    int canFlowD = 1 - ((obstacleEdgeCase >> BOTTOM) & 1);
+    int canFlowU = 1 - ((obstacleEdgeCase >> TOP) & 1);
+
+    int flowableEdgeCount = canFlowU + canFlowD + canFlowL + canFlowR;
+    if (flowableEdgeCount == 0) return;
+
+    float pressureLeft = PressureMap[int2(id.x - 1, id.y)].r;
+    float pressureDown = PressureMap[int2(id.x, id.y - 1)].r;
+    float pressureCentre = PressureMap[int2(id.x, id.y)].r;
+
+    float2 edgeVelocityComponents = VelocityMap[id.xy];
+    float velocityLeft = edgeVelocityComponents.x;
+    float velocityBottom = edgeVelocityComponents.y;
+
+    if (canFlowL)
+    {
+        velocityLeft = (velocityLeft - K * (pressureCentre - pressureLeft));
+    }
+    if (canFlowD)
+    {
+        velocityBottom = (velocityBottom - K * (pressureCentre - pressureDown));
+    }
+
+    VelocityMap[id.xy] = float2(velocityLeft, velocityBottom);
+}
+
+
+[numthreads(8,8,1)]
+void VelocitySelfAdvection(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+
+    int obstacleEdgeCase = (int)ObstacleMap[id.xy].g;
+    int obstacleLeft = (obstacleEdgeCase >> LEFT) & 1;
+    int obstacleBottom = (obstacleEdgeCase >> BOTTOM) & 1;
+
+    float2 velAdvected = 0;
+
+    if (!obstacleLeft)
+    {
+        float2 pos = CellEdgeLeft(id.x, id.y);
+        float2 posOld = RewindPos(pos);
+        velAdvected.x = GetVelocityAtWorldPos(posOld).x;
+    }
+    else
+    {
+        velAdvected.x = VelocityMapSample[id.xy].x;
+    }
+    if (!obstacleBottom)
+    {
+        float2 pos = CellEdgeBottom(id.x, id.y);
+        float2 posOld = RewindPos(pos);
+        velAdvected.y = GetVelocityAtWorldPos(posOld).y;
+    }
+    else
+    {
+        velAdvected.y = VelocityMapSample[id.xy].y;
+    }
+
+    VelocityMapAdvected[id.xy] = velAdvected;
+}
+
+[numthreads(8,8,1)]
+void AdvectedVelocityReadback(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+    VelocityMap[id.xy] = VelocityMapAdvected[id.xy];
+}
+
+
+[numthreads(8,8,1)]
+void SmokeAdvection(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    float2 worldPos = CellCentreFromCoord(id.x, id.y);
+    float2 posOld = RewindPos(worldPos);
+    float4 smokeAtPosPrev = GetSmokeAtWorldPos(posOld);
+    SmokeMapAdvected[id.xy] = smokeAtPosPrev;
+}
+
+[numthreads(8,8,1)]
+void SmokeDiffusionAndReadback(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    float4 centre = GetAdvectedSmokeData(id.x, id.y);
+    float4 left = GetAdvectedSmokeData(id.x - 1, id.y);
+    float4 right = GetAdvectedSmokeData(id.x + 1, id.y);
+    float4 top = GetAdvectedSmokeData(id.x, id.y + 1);
+    float4 bottom = GetAdvectedSmokeData(id.x, id.y - 1);
+
+    float4 laplacian = ((left + right + top + bottom) - 4 * centre) / (cellSize * cellSize);
+
+    // Temperature diffusion and decay
+    float temperatureNew = centre.a + temperatureDiffusion * deltaTime * laplacian.a;
+    temperatureNew *= exp(-deltaTime * temperatureDecay);
+
+    // Smoke diffusion and decay
+    float3 smokeNew = centre.rgb + smokeDiffusion * deltaTime * laplacian.rgb;
+    smokeNew *= exp(-deltaTime * smokeDecay);
+
+    SmokeMap[id.xy] = float4(smokeNew, temperatureNew);
+}
+
+[numthreads(8,8,1)]
+void Debug_UpdateDivergenceDisplay(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    float velocityLeft = VelocityMapSample[id.xy].x;
+    float velocityRight = VelocityMapSample[ClampCoord(id.x + 1, id.y)].x;
+    float velocityBottom = VelocityMapSample[id.xy].y;
+    float velocityTop = VelocityMapSample[ClampCoord(id.x, id.y + 1)].y;
+
+    float divergence = velocityRight - velocityLeft + velocityTop - velocityBottom;
+    DebugMap[id.xy] = float4(0, 0, 0, divergence);
+}
